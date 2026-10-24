@@ -1,148 +1,195 @@
-"""main.py - wires everything together and runs the demo scenario.
+# main.py - builds the network from a file, shows a menu and runs the simulation
+import random
 
-Usage:
-    python main.py                      # default demo
-    python main.py --verbose            # print every event as it happens
-    python main.py --plot               # also save results/netsim_results.png
-    python main.py --silent-failure     # routers only discover the failure when a send fails
-    python main.py --seed 7 --packets 40 --fail-tick 12 --restore-tick -1
-"""
-import argparse
-import os
-
+from link import Link
 from metrics import Metrics
-from network import Network
+from network import Network, TopologyError
 from node import Host, Router
 from packet import Packet
 from simulator import Simulator
 
-FAILED_LINK = ("R1", "R2")
-MAIN_FLOW = ("H1", "H2")
-
-POSITIONS = {"H1": (0, 1), "R1": (1, 1), "R2": (3, 1), "H2": (4, 1),
-             "R3": (2, -0.1), "H3": (2, -1.1)}
+TOPOLOGY_FILE = "topology.txt"
+RESULTS_FILE = "netsim_results.txt"
 
 
-def build_default_topology(seed=None, loss=0.03):
-    """The topology from the project schematic (plus a spare host H3):
-
-        H1 --- R1 ------- R2 --- H2
-                 \\       /
-                  \\-R3--/
-                     |
-                     H3
-    """
-    net = Network(seed=seed)
-    for r in ("R1", "R2", "R3"):
-        net.add_node(Router(r))
-    for h in ("H1", "H2", "H3"):
-        net.add_node(Host(h))
-    net.add_link("H1", "R1", bandwidth=100, delay=1, failure_probability=loss)
-    net.add_link("R1", "R2", bandwidth=50, delay=2, failure_probability=loss)   # fast primary
-    net.add_link("R1", "R3", bandwidth=20, delay=3, failure_probability=loss)   # slower detour
-    net.add_link("R3", "R2", bandwidth=20, delay=3, failure_probability=loss)
-    net.add_link("R2", "H2", bandwidth=100, delay=1, failure_probability=loss)
-    net.add_link("R3", "H3", bandwidth=100, delay=1, failure_probability=loss)
-    return net
-
-
-def parse_args(argv=None):
-    p = argparse.ArgumentParser(description="NetSim - packet routing simulator")
-    p.add_argument("--seed", type=int, default=42, help="random seed (default 42)")
-    p.add_argument("--packets", type=int, default=30, help="packets in the main H1->H2 flow")
-    p.add_argument("--fail-tick", type=int, default=10, help="tick at which R1-R2 fails")
-    p.add_argument("--restore-tick", type=int, default=20,
-                   help="tick at which R1-R2 is restored (-1 = never)")
-    p.add_argument("--loss", type=float, default=0.03, help="per-link random loss probability")
-    p.add_argument("--payload", type=int, default=500, help="payload bytes per packet")
-    p.add_argument("--silent-failure", action="store_true",
-                   help="link failure is undetected until a packet tries to use it")
-    p.add_argument("--verbose", action="store_true", help="print every simulation event")
-    p.add_argument("--plot", action="store_true", help="save graphs (needs matplotlib)")
-    p.add_argument("--out", default="results", help="output folder for graphs")
-    return p.parse_args(argv)
+# ---------------------------------------------------------------- file reading
+def load_topology(filename):
+    """Reads the topology file and returns a Network. Raises exceptions on bad input."""
+    network = Network()
+    file = open(filename, "r")
+    try:
+        line_number = 0
+        for line in file:
+            line_number += 1
+            line = line.strip()
+            if line == "" or line.startswith("#"):
+                continue
+            parts = line.split()
+            kind = parts[0].upper()
+            if kind == "ROUTER" and len(parts) == 2:
+                network.add_node(Router(parts[1]))
+            elif kind == "HOST" and len(parts) == 2:
+                network.add_node(Host(parts[1]))
+            elif kind == "LINK" and len(parts) == 6:
+                link = Link(parts[1], parts[2], float(parts[3]), float(parts[4]), float(parts[5]))
+                network.add_link(parts[1], parts[2], link)
+            else:
+                raise TopologyError("line " + str(line_number) + ": cannot understand '" + line + "'")
+    finally:
+        file.close()                # always runs, even if an error happened
+    network.rebuild_routing_tables()
+    return network
 
 
-def phase_of(tick, fail_tick, restore_tick):
-    if tick < fail_tick:
-        return "BEFORE failure"
-    if restore_tick is None or tick < restore_tick:
-        return "DURING failure"
-    return "AFTER restore"
+# ---------------------------------------------------------------- file writing / reading
+def save_results(simulator, filename):
+    file = open(filename, "w")
+    file.write("NETSIM RESULTS\n\n")
+    file.write("EVENT LOG\n")
+    for line in simulator.log:
+        file.write(line + "\n")
+    file.write("\nPACKET JOURNEYS\n")
+    for p in simulator.packets:
+        file.write(str(p) + "\n")
+    file.write("\n" + Metrics(simulator.packets).report("OVERALL METRICS"))
+    file.close()
+    print("Results saved to " + filename)
 
 
-def main(argv=None):
-    args = parse_args(argv)
-    restore_tick = args.restore_tick if args.restore_tick >= 0 else None
-    if restore_tick is not None and restore_tick <= args.fail_tick:
-        raise SystemExit("--restore-tick must be later than --fail-tick")
+def show_file(filename):
+    try:
+        file = open(filename, "r")
+        print(file.read())
+        file.close()
+    except FileNotFoundError:
+        print("No saved results yet. Choose option 7 first.")
 
-    Packet.reset_ids()
-    net = build_default_topology(args.seed, args.loss)
-    sim = Simulator(net, verbose=args.verbose)
 
-    # traffic: main flow H1->H2 every tick, plus a reverse flow H2->H1 every 2 ticks
-    payload = "x" * args.payload
-    for t in range(args.packets):
-        sim.schedule_packet(t, "H1", "H2", payload)
-        if t % 2 == 0:
-            sim.schedule_packet(t, "H2", "H1", payload)
-    sim.schedule_link_failure(args.fail_tick, *FAILED_LINK, detect=not args.silent_failure)
-    if restore_tick is not None:
-        sim.schedule_link_restore(restore_tick, *FAILED_LINK)
+# ---------------------------------------------------------------- console input helpers
+def ask_host(network, message):
+    name = input(message).strip().upper()
+    node = network.get_node(name)           # may raise TopologyError
+    if not isinstance(node, Host):
+        raise TopologyError(name + " is not a host")
+    return name
 
-    print("=" * 72)
-    print(" NetSim - packet routing and delivery with OOP")
-    print("=" * 72)
-    print("Topology (cost = link delay in ms):")
-    for link in net.links:
-        print(f"  {link}")
-    before = net.compute_shortest_path(*MAIN_FLOW)
-    print(f"\nShortest path {MAIN_FLOW[0]}->{MAIN_FLOW[1]} (healthy): "
-          f"{' -> '.join(before[0])}  (cost {before[1]:g} ms)")
-    print(f"Scenario: link {FAILED_LINK[0]}-{FAILED_LINK[1]} fails at tick {args.fail_tick}"
-          + (f", restored at tick {restore_tick}" if restore_tick is not None else ", never restored")
-          + (" [silent failure]" if args.silent_failure else "") + "\n")
 
-    if args.verbose:
-        print("---- live event log ----")
-    sim.run()
+def ask_number(message, default):
+    text = input(message + " [" + str(default) + "]: ").strip()
+    if text == "":
+        return default
+    return int(text)                        # may raise ValueError
 
-    if not args.verbose:
-        print("---- key events (failures, route updates, reroutes, drops) ----")
-        for e in sim.log:
-            if e.kind in ("LINKDOWN", "LINKUP", "ROUTES", "REROUTE", "DROP", "WARNING"):
-                print(" ", e)
 
-    print("\n---- packet journeys ----")
-    for p in sim.packets:
-        print(f"  {p.journey()}   ({phase_of(p.created_tick, args.fail_tick, restore_tick)})")
+def show_routing_tables(network):
+    for node_id in network.nodes:
+        table = network.get_node(node_id).get_routing_table()
+        if table:
+            print("Routing table of " + node_id + ":")
+            for destination in sorted(table):
+                print("   to " + destination + " via " + table[destination])
 
-    duration = sim.tick + 1
-    overall = Metrics(sim.packets, duration)
+
+def show_links(network):
+    for key in network.links:
+        print("  " + str(network.links[key]))
+
+
+# ---------------------------------------------------------------- the automatic demo
+def run_demo(simulator, packets_per_phase):
+    network = simulator.network
+    path = network.compute_shortest_path("H1", "H2")
+    print("\nPhase 1: healthy network. Best path H1 -> H2: " + " -> ".join(path[0]) +
+          " (cost " + str(path[1]) + " ms)")
+    simulator.send("H1", "H2", packets_per_phase)
+    phase1 = len(simulator.packets)
+
+    print("\nPhase 2: link R1-R2 fails.")
+    simulator.fail_link("R1", "R2")
+    simulator.send("H1", "H2", packets_per_phase)
+    phase2 = len(simulator.packets)
+
+    print("\nPhase 3: link R1-R2 is restored.")
+    simulator.restore_link("R1", "R2")
+    simulator.send("H1", "H2", packets_per_phase)
+
+    print("\nPhase 4: link fails WITHOUT routers knowing (found in the middle of a journey).")
+    simulator.fail_link("R1", "R2", False)
+    simulator.send("H1", "H2", 2)
+
     print()
-    print(overall.report("OVERALL METRICS (all flows)"))
-    for name in ("BEFORE failure", "DURING failure", "AFTER restore"):
-        subset = overall.subset(lambda p, n=name: (p.source, p.destination) == MAIN_FLOW
-                                and phase_of(p.created_tick, args.fail_tick, restore_tick) == n)
-        if subset.sent:
-            print()
-            print(subset.report(f"{MAIN_FLOW[0]}->{MAIN_FLOW[1]} {name}"))
-
-    if args.plot:
-        from plots import make_results_figure
-        os.makedirs(args.out, exist_ok=True)
-        # compute the two paths the plot highlights without disturbing the finished run
-        ref = build_default_topology(args.seed, args.loss)
-        path_before = ref.compute_shortest_path(*MAIN_FLOW)[0]
-        ref.simulate_link_failure(*FAILED_LINK)
-        path_after = ref.compute_shortest_path(*MAIN_FLOW)[0]
-        fig = make_results_figure(ref, POSITIONS, sim.packets, MAIN_FLOW, args.fail_tick,
-                                  restore_tick, FAILED_LINK, path_before, path_after,
-                                  os.path.join(args.out, "netsim_results.png"))
-        print(f"\nGraph saved to {fig}")
-    return sim
+    packets = simulator.packets
+    print(Metrics(packets[0:phase1]).report("Phase 1 - before failure"))
+    print(Metrics(packets[phase1:phase2]).report("Phase 2 - during failure"))
+    print(Metrics(packets[phase2:]).report("Phase 3 and 4 - after restore / silent failure"))
+    print(Metrics(packets).report("OVERALL"))
+    simulator.restore_link("R1", "R2")
 
 
-if __name__ == "__main__":
-    main()
+# ---------------------------------------------------------------- main menu
+def main():
+    random.seed(3)                          # same results every run (remove for random runs)
+    Packet.reset_counter()
+    try:
+        network = load_topology(TOPOLOGY_FILE)
+    except FileNotFoundError:
+        print("Cannot find " + TOPOLOGY_FILE + ". Run this program from the netsim folder.")
+        return
+    except (ValueError, TopologyError) as error:
+        print("Problem in " + TOPOLOGY_FILE + ": " + str(error))
+        return
+
+    simulator = Simulator(network)
+    print("=== NetSim: Network Packet Simulator ===")
+    print("Loaded " + str(len(network.nodes)) + " nodes and " + str(len(network.links)) + " links.")
+
+    while True:
+        print("\n1. Run the full automatic demo")
+        print("2. Send packets between two hosts")
+        print("3. Fail a link")
+        print("4. Restore a link")
+        print("5. Show routing tables")
+        print("6. Show metrics")
+        print("7. Save results to file")
+        print("8. View saved results file")
+        print("9. Show links")
+        print("0. Exit")
+        choice = input("Enter choice: ").strip()
+
+        try:
+            if choice == "1":
+                run_demo(simulator, ask_number("Packets per phase", 5))
+            elif choice == "2":
+                source = ask_host(network, "Source host (H1/H2/H3): ")
+                destination = ask_host(network, "Destination host: ")
+                simulator.send(source, destination, ask_number("How many packets", 3))
+            elif choice == "3":
+                a = input("First node of the link: ").strip().upper()
+                b = input("Second node of the link: ").strip().upper()
+                simulator.fail_link(a, b)
+            elif choice == "4":
+                a = input("First node of the link: ").strip().upper()
+                b = input("Second node of the link: ").strip().upper()
+                simulator.restore_link(a, b)
+            elif choice == "5":
+                show_routing_tables(network)
+            elif choice == "6":
+                print(Metrics(simulator.packets).report("METRICS SO FAR"))
+            elif choice == "7":
+                save_results(simulator, RESULTS_FILE)
+            elif choice == "8":
+                show_file(RESULTS_FILE)
+            elif choice == "9":
+                show_links(network)
+            elif choice == "0":
+                print("Goodbye!")
+                break
+            else:
+                print("Please enter a number from 0 to 9.")
+        except ValueError:
+            print("Error: please type a whole number.")
+        except TopologyError as error:
+            print("Error: " + str(error))
+
+
+main()

@@ -1,92 +1,44 @@
-"""link.py - the Link class: a physical connection between two nodes.
-
-This is the ONLY place where "does this packet make it across?" is decided.
-"""
+# link.py - the Link class: a connection between two nodes.
+# This is the only place that decides whether a packet is lost.
 import random
-from dataclasses import dataclass
-from enum import Enum
-
-
-class TransmitStatus(Enum):
-    OK = "ok"
-    LOST = "lost"      # random loss on a working link
-    DOWN = "down"      # link has failed
-
-
-@dataclass(frozen=True)
-class TransmitResult:
-    status: TransmitStatus
-    delay: float       # milliseconds spent on the link
-
-    @property
-    def delivered(self):
-        return self.status is TransmitStatus.OK
 
 
 class Link:
-    """Bidirectional link with bandwidth (Mbps), delay (ms) and a loss probability."""
-
-    def __init__(self, node_a, node_b, bandwidth=10.0, delay=1.0,
-                 failure_probability=0.0, rng=None):
-        if node_a == node_b:
-            raise ValueError("A link must connect two different nodes")
-        if bandwidth <= 0:
-            raise ValueError("bandwidth must be positive")
-        if delay < 0:
-            raise ValueError("delay cannot be negative")
-        if not 0.0 <= failure_probability <= 1.0:
-            raise ValueError("failure_probability must be within [0, 1]")
+    # default values for delay, bandwidth and loss
+    def __init__(self, node_a, node_b, delay=1, bandwidth=10, loss=0.0):
+        if not Link.is_valid_loss(loss):
+            raise ValueError("loss must be between 0 and 1")
         self.node_a = node_a
         self.node_b = node_b
-        self.bandwidth = bandwidth
-        self.delay = delay
-        self.failure_probability = failure_probability
-        self._rng = rng if rng is not None else random.Random()
-        self._up = True
+        self.delay = delay              # ms
+        self.bandwidth = bandwidth      # Mbps
+        self.loss = loss                # probability of losing a packet
+        self.__up = True                # private: use fail() / restore()
 
-    # -- state -------------------------------------------------------------
-    @property
+    @staticmethod
+    def is_valid_loss(value):
+        return 0 <= value <= 1
+
     def is_up(self):
-        return self._up
+        return self.__up
 
     def fail(self):
-        self._up = False
+        self.__up = False
 
     def restore(self):
-        self._up = True
+        self.__up = True
 
-    # -- helpers -----------------------------------------------------------
-    @property
-    def cost(self):
-        """Routing metric used by Dijkstra (propagation delay in ms)."""
-        return self.delay
-
-    @property
-    def endpoints(self):
-        return (self.node_a, self.node_b)
-
-    def other_end(self, node_id):
-        if node_id == self.node_a:
-            return self.node_b
-        if node_id == self.node_b:
-            return self.node_a
-        raise ValueError(f"{node_id} is not an endpoint of {self}")
-
-    def transmission_time(self, packet):
-        """Time (ms) to push the packet's bits onto the wire."""
-        return packet.size_bytes * 8 / (self.bandwidth * 1_000_000) * 1000
-
-    # -- core behaviour ----------------------------------------------------
     def transmit(self, packet):
-        """Decide whether the packet gets through, and how long that takes."""
-        if not self._up:
-            return TransmitResult(TransmitStatus.DOWN, 0.0)
-        delay = self.delay + self.transmission_time(packet)
-        if self._rng.random() < self.failure_probability:
-            return TransmitResult(TransmitStatus.LOST, delay)
-        return TransmitResult(TransmitStatus.OK, delay)
+        """Returns a tuple (status, delay). status is 'ok', 'lost' or 'down'."""
+        if not self.__up:
+            return ("down", 0)
+        # propagation delay + time to put the bits on the wire
+        total = self.delay + packet.size() * 8 / (self.bandwidth * 1000)
+        if random.random() < self.loss:
+            return ("lost", total)
+        return ("ok", total)
 
-    def __repr__(self):
-        state = "UP" if self._up else "DOWN"
-        return (f"Link({self.node_a}<->{self.node_b}, {self.bandwidth}Mbps, "
-                f"{self.delay}ms, loss={self.failure_probability:.0%}, {state})")
+    def __str__(self):
+        state = "UP" if self.__up else "DOWN"
+        return (self.node_a + " <-> " + self.node_b + "  delay=" + str(self.delay) +
+                "ms  bandwidth=" + str(self.bandwidth) + "Mbps  loss=" + str(self.loss) + "  " + state)

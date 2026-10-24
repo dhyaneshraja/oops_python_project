@@ -1,155 +1,122 @@
-"""network.py - the topology (graph of nodes + links) and ALL routing logic.
+# network.py - the topology (nodes + links) and ALL routing logic (Dijkstra)
 
-Network HAS nodes and links (composition). It is the only module that runs
-Dijkstra and (re)builds routing tables; routers just look results up.
-"""
-import heapq
-import random
 
-from link import Link
-from node import Host, Router
+class TopologyError(Exception):
+    """Our own exception, raised when the network description is wrong."""
 
 
 class Network:
-    def __init__(self, seed=None):
-        self._seed = seed
-        self._nodes = {}                  # id -> Node
-        self._adjacency = {}              # id -> {neighbour id -> Link}  (adjacency list)
+    def __init__(self):
+        self.nodes = {}             # node_id -> Node object
+        self.links = {}             # (id1, id2) -> Link object
 
-    # -- building the topology --------------------------------------------
+    @staticmethod
+    def make_key(a, b):
+        return tuple(sorted([a, b]))
+
     def add_node(self, node):
-        if node.node_id in self._nodes:
-            raise ValueError(f"duplicate node id {node.node_id}")
-        self._nodes[node.node_id] = node
-        self._adjacency[node.node_id] = {}
-        return node
+        if node.get_id() in self.nodes:
+            raise TopologyError("duplicate node " + node.get_id())
+        self.nodes[node.get_id()] = node
 
-    def add_link(self, a, b, bandwidth=10.0, delay=1.0, failure_probability=0.0):
-        for n in (a, b):
-            if n not in self._nodes:
-                raise KeyError(f"unknown node {n}")
-        if b in self._adjacency[a]:
-            raise ValueError(f"link {a}-{b} already exists")
-        # each link gets its own reproducible RNG stream derived from the seed
-        rng = random.Random(f"{self._seed}:{'-'.join(sorted((a, b)))}")
-        link = Link(a, b, bandwidth, delay, failure_probability, rng)
-        self._adjacency[a][b] = link
-        self._adjacency[b][a] = link
-        self._nodes[a].add_neighbor(b)
-        self._nodes[b].add_neighbor(a)
-        return link
+    def add_link(self, a, b, link):
+        if a not in self.nodes or b not in self.nodes:
+            raise TopologyError("link " + a + "-" + b + " uses an unknown node")
+        self.links[Network.make_key(a, b)] = link
+        self.nodes[a].add_neighbor(b)
+        self.nodes[b].add_neighbor(a)
 
-    # -- lookups -----------------------------------------------------------
     def get_node(self, node_id):
-        return self._nodes[node_id]
+        if node_id not in self.nodes:
+            raise TopologyError("unknown node " + node_id)
+        return self.nodes[node_id]
 
     def get_link(self, a, b):
-        return self._adjacency.get(a, {}).get(b)
+        return self.links.get(Network.make_key(a, b))
 
-    @property
-    def nodes(self):
-        return [self._nodes[k] for k in sorted(self._nodes)]
-
-    @property
-    def routers(self):
-        return [n for n in self.nodes if isinstance(n, Router)]
-
-    @property
-    def hosts(self):
-        return [n for n in self.nodes if isinstance(n, Host)]
-
-    @property
-    def links(self):
-        seen, out = set(), []
-        for a in sorted(self._adjacency):
-            for b, link in sorted(self._adjacency[a].items()):
-                key = frozenset((a, b))
-                if key not in seen:
-                    seen.add(key)
-                    out.append(link)
-        return out
-
-    # -- Dijkstra ----------------------------------------------------------
+    # ---------------- Dijkstra's algorithm ----------------
     def _dijkstra(self, source):
-        """Single-source shortest paths over links that are currently UP.
-
-        Packets are never routed *through* a node with forwards_traffic False
-        (i.e. a Host), only to or from it.
-        """
-        dist = {source: 0.0}
-        prev = {}
-        heap = [(0.0, source)]
-        done = set()
-        while heap:
-            d, u = heapq.heappop(heap)
-            if u in done:
+        distance = {source: 0}      # best known cost to each node
+        previous = {}               # previous[x] = node before x on the best path
+        visited = []
+        while True:
+            # pick the unvisited node with the smallest distance
+            current = None
+            for node_id in distance:
+                if node_id not in visited:
+                    if current is None or distance[node_id] < distance[current]:
+                        current = node_id
+            if current is None:
+                break
+            visited.append(current)
+            # packets may start at a host but never pass THROUGH one
+            if current != source and not self.nodes[current].can_forward():
                 continue
-            done.add(u)
-            if u != source and not self._nodes[u].forwards_traffic:
-                continue
-            for v, link in sorted(self._adjacency[u].items()):
-                if not link.is_up:
-                    continue
-                nd = d + link.cost
-                if nd < dist.get(v, float("inf")):
-                    dist[v] = nd
-                    prev[v] = u
-                    heapq.heappush(heap, (nd, v))
-        return dist, prev
+            for neighbor in self.nodes[current].get_neighbors():
+                link = self.get_link(current, neighbor)
+                if not link.is_up():
+                    continue        # failed links are ignored
+                new_cost = distance[current] + link.delay
+                if neighbor not in distance or new_cost < distance[neighbor]:
+                    distance[neighbor] = new_cost
+                    previous[neighbor] = current
+        return distance, previous
 
     def compute_shortest_path(self, source, destination):
-        """Return (path, cost) for the cheapest route, or None if unreachable."""
-        for n in (source, destination):
-            if n not in self._nodes:
-                raise KeyError(f"unknown node {n}")
-        dist, prev = self._dijkstra(source)
-        if destination not in dist:
+        """Returns (path_list, cost) or None if there is no path."""
+        self.get_node(source)
+        self.get_node(destination)
+        distance, previous = self._dijkstra(source)
+        if destination not in distance:
             return None
         path = [destination]
         while path[-1] != source:
-            path.append(prev[path[-1]])
+            path.append(previous[path[-1]])     # walk backwards from the destination
         path.reverse()
-        return path, dist[destination]
+        return (path, distance[destination])
 
-    # -- routing tables ----------------------------------------------------
-    def routing_snapshot(self):
-        return {r.node_id: r.routing_table for r in self.routers}
-
+    # ---------------- routing tables ----------------
     def rebuild_routing_tables(self):
-        """Recompute every router's table. Returns what changed:
-        {router_id: {destination: (old_next_hop, new_next_hop)}}."""
-        changes = {}
-        for router in self.routers:
-            old = router.routing_table
-            dist, prev = self._dijkstra(router.node_id)
-            new = {}
-            for dest in dist:
-                if dest == router.node_id:
+        """Recalculates every router's table. Returns a list of text lines describing changes."""
+        changes = []
+        for node_id in self.nodes:
+            node = self.nodes[node_id]
+            if not node.can_forward():
+                continue                            # hosts don't keep routing tables
+            distance, previous = self._dijkstra(node_id)
+            table = {}
+            for destination in distance:
+                if destination == node_id:
                     continue
-                hop = dest
-                while prev[hop] != router.node_id:
-                    hop = prev[hop]
-                new[dest] = hop
-            router.set_routing_table(new)
-            diff = {d: (old.get(d), new.get(d))
-                    for d in set(old) | set(new) if old.get(d) != new.get(d)}
-            if diff:
-                changes[router.node_id] = dict(sorted(diff.items()))
+                hop = destination                   # walk back to find the first hop
+                while previous[hop] != node_id:
+                    hop = previous[hop]
+                table[destination] = hop
+            old = node.get_routing_table()
+            node.set_routing_table(table)           # hosts ignore this call
+            for destination in table:
+                if old.get(destination) != table[destination]:
+                    changes.append(node_id + ": to " + destination + " via " +
+                                   str(old.get(destination, "-")) + " -> " + table[destination])
+            for destination in old:
+                if destination not in table:        # route disappeared
+                    changes.append(node_id + ": to " + destination + " via " + old[destination] +
+                                   " -> UNREACHABLE")
         return changes
 
-    # -- failures ----------------------------------------------------------
-    def _require_link(self, a, b):
+    # ---------------- failures ----------------
+    def fail_link(self, a, b, detect=True):
         link = self.get_link(a, b)
         if link is None:
-            raise KeyError(f"no link between {a} and {b}")
-        return link
+            raise TopologyError("no link between " + a + " and " + b)
+        link.fail()
+        if detect:
+            return self.rebuild_routing_tables()
+        return []                   # undetected: routers still have old tables
 
-    def simulate_link_failure(self, a, b, reroute=True):
-        """Take a link down. With reroute=True the network recalculates at once;
-        with reroute=False routers only find out when a transmission fails."""
-        self._require_link(a, b).fail()
-        return self.rebuild_routing_tables() if reroute else {}
-
-    def restore_link(self, a, b, reroute=True):
-        self._require_link(a, b).restore()
-        return self.rebuild_routing_tables() if reroute else {}
+    def restore_link(self, a, b):
+        link = self.get_link(a, b)
+        if link is None:
+            raise TopologyError("no link between " + a + " and " + b)
+        link.restore()
+        return self.rebuild_routing_tables()
