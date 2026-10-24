@@ -1,0 +1,16 @@
+# NetSim topology file.   Lines starting with # are comments.
+# ROUTER <id>
+# HOST <id>
+# LINK <node1> <node2> <delay_ms> <bandwidth_Mbps> <loss_probability>
+ROUTER R1
+ROUTER R2
+ROUTER R3
+HOST H1
+HOST H2
+HOST H3
+LINK H1 R1 1 100 0.05
+LINK R1 R2 2 50 0.05
+LINK R1 R3 3 20 0.05
+LINK R3 R2 3 20 0.05
+LINK R2 H2 1 100 0.05
+LINK R3 H3 1 100 0.05

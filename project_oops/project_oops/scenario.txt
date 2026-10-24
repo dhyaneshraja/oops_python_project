@@ -1,0 +1,31 @@
+# NetSim demo scenario. One command per line:
+#   SEND <src> <dst> [count]      unreliable packets
+#   RELIABLE <src> <dst> [count]  DATA + ACK with retries
+#   TRACE <src> <dst>             show the route
+#   FAIL / SILENTFAIL / RESTORE <node1> <node2>
+#   BLOCK <firewall> <host>
+#   ROUTES  TRAFFIC  CHART  VERBOSE ON|OFF
+#   REPORT <title>                metrics since the previous REPORT
+TRACE H1 H2
+SEND H1 H2 8
+REPORT Phase 1 - healthy network
+
+FAIL R1 R2
+TRACE H1 H2
+SEND H1 H2 8
+REPORT Phase 2 - link R1-R2 failed, traffic rerouted via R3
+
+RESTORE R1 R2
+SILENTFAIL R1 R2
+SEND H1 H2 3
+REPORT Phase 3 - failure found in the middle of a journey
+RESTORE R1 R2
+
+RELIABLE H2 H4 6
+REPORT Phase 4 - reliable transfers over the lossy wireless link
+
+SEND H3 H4 3
+REPORT Phase 5 - firewall R4 blocks H3
+
+TRAFFIC
+CHART
